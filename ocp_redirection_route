@@ -1,0 +1,174 @@
+# OpenShift Vanity Route Automated Failover Configuration Guide
+
+This document provides two distinct, zero-deployment approaches for configuring automated HTTP redirection from **DC2 Cluster 2** to **DC1** on OpenShift Route failures (`502 Bad Gateway`, `503 Service Unavailable`, `504 Gateway Timeout`) for the isolated path (`/uri-2-set/isolation`).
+
+---
+
+## Option 1: Route-Scoped Custom Error ConfigMap (Recommended for Restricted Environments)
+
+Use this option if your cluster security policy blocks `haproxy.router.openshift.io/backend-config-snippet`.
+
+This approach binds a custom HTTP redirect response ConfigMap **exclusively to your specific Route object**. No other routes in your namespace or cluster are affected.
+
+### 1. `configmap.yaml`
+
+```yaml
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: service-a-redirect-50x-cm
+  namespace: service-a-cluster2-ns
+data:
+  # HAProxy serves this static HTTP response upon encountering 502/503/504 errors
+  error-page-50x.http: |
+    HTTP/1.1 307 Temporary Redirect
+    Location: https://service-my-dc1.abc.net/uri-2-set/isolation
+    Content-Type: text/html
+    Cache-Control: no-cache, no-store, must-revalidate
+
+    <html><body><h1>307 Temporary Redirect</h1><p>Redirecting request to DC1...</p></body></html>
+
+```
+
+### 2. `routes.yaml`
+
+```yaml
+# 1. Direct Route for DC2
+apiVersion: route.openshift.io/v1
+kind: Route
+metadata:
+  name: service-a-cluster2-direct-route
+  namespace: service-a-cluster2-ns
+  labels:
+    app.kubernetes.io/name: service-a
+    app.kubernetes.io/component: route
+spec:
+  host: service-my-dc2.abc.net
+  path: /uri-2-set/isolation
+  to:
+    kind: Service
+    name: service-a-cluster2-svc
+    weight: 100
+  port:
+    targetPort: 8080-tcp
+  tls:
+    termination: edge
+    insecureEdgeTerminationPolicy: Redirect
+---
+# 2. Vanity Route for DC2 (Using Bound ConfigMap)
+apiVersion: route.openshift.io/v1
+kind: Route
+metadata:
+  name: service-a-cluster2-vanity-route
+  namespace: service-a-cluster2-ns
+  labels:
+    app.kubernetes.io/name: service-a
+    app.kubernetes.io/component: route
+  annotations:
+    haproxy.router.openshift.io/timeout: "10s"
+    
+    # Enable interception of 502, 503, and 504 errors
+    haproxy.router.openshift.io/custom-errors: "502 503 504"
+    
+    # Binds the custom error response EXCLUSIVELY to this route
+    haproxy.router.openshift.io/custom-errors-configmap: "service-a-redirect-50x-cm"
+spec:
+  host: service-my.abc.net
+  path: /uri-2-set/isolation
+  to:
+    kind: Service
+    name: service-a-cluster2-svc
+    weight: 100
+  port:
+    targetPort: 8080-tcp
+  tls:
+    termination: edge
+    insecureEdgeTerminationPolicy: Redirect
+
+```
+
+---
+
+## Option 2: Method-Aware Backend Config Snippet (Dynamic HTTP 302 / 307 Redirection)
+
+Use this option if `haproxy.router.openshift.io/backend-config-snippet` is permitted in your cluster.
+
+This approach inspects the incoming HTTP request method directly in HAProxy memory:
+
+* **`POST`, `PUT`, `PATCH` (Uploads / Streams / `InputStream`):** Returns **`HTTP 307 Temporary Redirect`** to ensure the client preserves the original HTTP method and body payload when failing over to DC1.
+* **`GET`, `HEAD`, `DELETE`, `OPTIONS` (Standard REST):** Returns **`HTTP 302 Found`**.
+
+### `routes.yaml`
+
+```yaml
+# 1. Direct Route for DC2
+apiVersion: route.openshift.io/v1
+kind: Route
+metadata:
+  name: service-a-cluster2-direct-route
+  namespace: service-a-cluster2-ns
+  labels:
+    app.kubernetes.io/name: service-a
+    app.kubernetes.io/component: route
+spec:
+  host: service-my-dc2.abc.net
+  path: /uri-2-set/isolation
+  to:
+    kind: Service
+    name: service-a-cluster2-svc
+    weight: 100
+  port:
+    targetPort: 8080-tcp
+  tls:
+    termination: edge
+    insecureEdgeTerminationPolicy: Redirect
+---
+# 2. Vanity Route for DC2 (Using HAProxy Snippet)
+apiVersion: route.openshift.io/v1
+kind: Route
+metadata:
+  name: service-a-cluster2-vanity-route
+  namespace: service-a-cluster2-ns
+  labels:
+    app.kubernetes.io/name: service-a
+    app.kubernetes.io/component: route
+  annotations:
+    haproxy.router.openshift.io/timeout: "10s"
+    
+    # HAProxy ACL logic applied strictly to this route's backend block
+    haproxy.router.openshift.io/backend-config-snippet: |
+      # 1. Match streaming/upload methods (POST, PUT, PATCH)
+      acl is_stream_method method POST PUT PATCH
+
+      # 2. Return HTTP 307 for streaming calls to preserve request body payload
+      http-response return status 307 default-hdr location "https://service-my-dc1.abc.net%[path]" if { status 502 503 504 } is_stream_method
+
+      # 3. Return HTTP 302 for non-streaming REST calls
+      http-response return status 302 default-hdr location "https://service-my-dc1.abc.net%[path]" if { status 502 503 504 } !is_stream_method
+spec:
+  host: service-my.abc.net
+  path: /uri-2-set/isolation
+  to:
+    kind: Service
+    name: service-a-cluster2-svc
+    weight: 100
+  port:
+    targetPort: 8080-tcp
+  tls:
+    termination: edge
+    insecureEdgeTerminationPolicy: Redirect
+
+```
+
+---
+
+## Technical Comparison Matrix
+
+| Property | Option 1: Custom Error ConfigMap | Option 2: Backend Config Snippet |
+| --- | --- | --- |
+| **Route Scope / Isolation** | **100% Isolated** (Bound via route annotation) | **100% Isolated** (Bound to backend stanza) |
+| **Impact on Other Routes** | **Zero** | **Zero** |
+| **New Deployments Needed** | **None** | **None** |
+| **Cluster-Admin Permissions Needed** | **No** | **No** (Unless snippets are globally blocked) |
+| **Redirection Behavior** | Fixed **HTTP 307** for all requests | **HTTP 307** for `POST`/`PUT`/`PATCH`; **HTTP 302** for `GET` |
+| **`InputStream` Payload Preservation** | Yes | Yes |
