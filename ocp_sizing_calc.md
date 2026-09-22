@@ -51,3 +51,8 @@ In Cell `A25` (merged across `A25:D25`), write an Excel formula that outputs the
 2. Highlight calculated values in bold text.
 3. Enable wrap text on generated JVM argument cells (`A22` and `A25`).
 4. Ensure standard cell borders are visible across the entire table.
+
+-----------
+Add this args in the last 
+
+-XX:StartFlightRecording=disk=true,dumponexit=true,maxage=30m,name=continuous_recording,filename=recording.jfr
